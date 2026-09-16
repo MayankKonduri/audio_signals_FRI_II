@@ -1,5 +1,5 @@
-# Turns a microphone or a WAV file into identical blocks of mono 16 kHz audio,
-# each stamped with when it was captured.
+# Goal: turn a microphone or a WAV file into identical blocks of mono 16 kHz
+# audio, each stamped with when it was captured. Nothing is written to disk.
 #
 #   cap = AudioCapture(CONFIG)                       # microphone
 #   cap = AudioCapture(CONFIG, wav="clips/x.wav")    # file, same output
@@ -21,17 +21,18 @@ from scipy.signal import firwin, lfilter, resample_poly
 Block = namedtuple("Block", "t samples")
 
 
-def resolve_device(spec, backend=None, channels=None, samplerate=None):
+def resolve_device(spec):
     # spec is None (system default), an int index, or a name fragment.
-    # Indices move between machines, so config holds a name.
+    # Matching ignores spaces and case, so "USB Audio" finds both
+    # "Microphone (USBAudio1.0)" on Windows and "USB Audio Device" on Linux.
+    # If nothing matches, fall back to the system default rather than failing.
     import sounddevice as sd
 
     if spec is None or isinstance(spec, int):
         return spec
 
     hostapis = sd.query_hostapis()
-    wanted = spec.lower()
-    want_api = backend.lower() if backend else None
+    wanted = spec.lower().replace(" ", "")
 
     def api_of(d):
         return hostapis[d["hostapi"]]["name"]
@@ -39,50 +40,17 @@ def resolve_device(spec, backend=None, channels=None, samplerate=None):
     matches = [
         (i, d) for i, d in enumerate(sd.query_devices())
         if d["max_input_channels"] > 0
-        and wanted in d["name"].lower()
-        and (want_api is None or want_api in api_of(d).lower())
+        and wanted in d["name"].lower().replace(" ", "")
     ]
 
     if not matches:
-        listed = "\n  ".join(
-            f"[{i}] {api_of(d):<20} {d['name']}"
-            for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0
-        )
-        raise RuntimeError(
-            f"No input device matching name {spec!r}"
-            + (f" and backend {backend!r}" if backend else "")
-            + f". Available:\n  {listed}"
-        )
+        print(f"note: no input device matching {spec!r}, using the system default")
+        return None
 
-    # One mic can appear under several backends with the same name. Keeping
-    # only those that accept the requested channels and rate separates them.
-    if channels or samplerate:
-        usable = []
-        for i, d in matches:
-            try:
-                sd.check_input_settings(device=i, channels=channels,
-                                        samplerate=samplerate, dtype="float32")
-                usable.append((i, d))
-            except Exception:
-                pass
-        if not usable:
-            listed = "\n  ".join(
-                f"[{i}] {api_of(d):<20} {d['name']}  "
-                f"({d['max_input_channels']} ch, {int(d['default_samplerate'])} Hz)"
-                for i, d in matches
-            )
-            raise RuntimeError(
-                f"{len(matches)} device(s) match {spec!r}, but none accept "
-                f"channels={channels}, samplerate={samplerate}:\n  {listed}\n"
-                "Adjust input_channels or capture_sample_rate in config.py."
-            )
-        matches = usable
-
-    if len(matches) > 1:
-        listed = "\n  ".join(f"[{i}] {api_of(d):<20} {d['name']}" for i, d in matches)
-        print(f"note: {len(matches)} devices still match, using the first:\n  {listed}")
-
-    index, dev = matches[0]
+    # Windows lists one mic under several backends. WASAPI reaches every
+    # channel at the device's real rate, where MME caps at 2 and reports 44100.
+    wasapi = [m for m in matches if "wasapi" in api_of(m[1]).lower()]
+    index, dev = (wasapi or matches)[0]
     print(f"device [{index}] {dev['name']!r} via {api_of(dev)}")
     return index
 
@@ -123,14 +91,12 @@ class Resampler:
         return y[idx].astype(np.float32)
 
 
-def to_mono(x, use_channel=None):
+def to_mono(x):
     if x.ndim == 1:
         return x
     if x.shape[1] == 1:
         return x[:, 0]
-    if use_channel is None:
-        return x.mean(axis=1)
-    return x[:, use_channel]
+    return x.mean(axis=1)
 
 
 class AudioCapture:
@@ -177,12 +143,7 @@ class AudioCapture:
     def _start_mic(self):
         import sounddevice as sd
 
-        device = resolve_device(
-            self.cfg["input_device"],
-            backend=self.cfg.get("input_backend"),
-            channels=self.cfg["input_channels"],
-            samplerate=self.cfg["capture_sample_rate"],
-        )
+        device = resolve_device(self.cfg["input_device"])
         info = sd.query_devices(device if device is not None else sd.default.device[0])
 
         self.channels = self.cfg["input_channels"] or int(info["max_input_channels"])
@@ -238,7 +199,6 @@ class AudioCapture:
     def blocks(self, timeout=1.0):
         # Skips the first blocks: some backends send digital silence while the
         # device spins up, which is not a reading of the room.
-        use_channel = self.cfg["use_channel"]
         warmup = 0 if self.wav else self.cfg.get("warmup_blocks", 2)
         seen = 0
 
@@ -251,7 +211,7 @@ class AudioCapture:
                 return
 
             seen += 1
-            mono = to_mono(item.samples, use_channel)
+            mono = to_mono(item.samples)
             resampled = self._resampler(mono)      # always run, to keep state warm
 
             if seen <= warmup:

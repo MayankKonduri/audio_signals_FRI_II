@@ -1,10 +1,9 @@
-# Checks that capture.py works on this machine and microphone.
+# Goal: check that capture.py delivers blocks steadily and the audio saves.
+# Level analysis belongs in levels.py, not here.
 #
-#   python tools/test_capture.py                  live mic, 10 seconds
-#   python tools/test_capture.py --seconds 5
+#   python tools/test_capture.py                  live mic, 5 seconds
+#   python tools/test_capture.py --seconds 20
 #   python tools/test_capture.py --wav clips/hallway.wav
-
-# Runs the real capture code for ten seconds and checks it behaves: steady block timing, no dropped blocks, no silence or clipping, and saves the audio so you can listen back.
 
 import argparse
 import sys
@@ -22,14 +21,9 @@ from audio_context.config import CONFIG, check
 OUT = Path(__file__).resolve().parents[1] / "clips" / "capture_test.wav"
 
 
-def meter(db, width=34, lo=-60.0, hi=0.0):
-    filled = int(np.clip((db - lo) / (hi - lo), 0, 1) * width)
-    return "#" * filled + "-" * (width - filled)
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seconds", type=float, default=10.0)
+    ap.add_argument("--seconds", type=float, default=5.0)
     ap.add_argument("--wav", default=None, help="read a file instead of the mic")
     args = ap.parse_args()
 
@@ -45,23 +39,21 @@ def main():
         cap.start()
     except Exception as e:
         print(f"\nCould not open audio: {e}\n")
-        print("  - wrong input_device in config.py; run tools/check_devices.py")
-        print("  - another program is holding the microphone")
+        print("  - run tools/check_devices.py to see if the mic is found")
+        print("  - another program may be holding the microphone")
         print("  - Windows: Settings > Privacy > Microphone, allow desktop apps")
         return 1
 
     if not args.wav:
-        print(f"\nTalk into the microphone for {args.seconds:.0f} seconds.\n")
+        print(f"\nCapturing for {args.seconds:.0f} seconds...")
 
-    stamps, levels, chunks = [], [], []
+    stamps, chunks = [], []
     deadline = time.time() + args.seconds
     try:
         for block in cap.blocks():
-            db = 20 * np.log10(np.sqrt(np.mean(block.samples ** 2)) + 1e-12)
             stamps.append(block.t)
-            levels.append(db)
             chunks.append(block.samples)
-            print(f"\r  {db:6.1f} dBFS  [{meter(db)}]", end="", flush=True)
+            print(f"\r  {len(chunks)} blocks", end="", flush=True)
             if time.time() >= deadline:
                 break
     except KeyboardInterrupt:
@@ -71,50 +63,56 @@ def main():
     print()
 
     if not chunks:
-        print("\nFAIL: no audio blocks arrived. The stream opened but the callback "
-              "never fired. Check the device and the OS microphone permission.")
+        print("\nFAIL: no blocks arrived. The stream opened but the callback "
+              "never fired.")
         return 1
 
     audio = np.concatenate(chunks)
     sizes = {len(c) for c in chunks}
     gaps = np.diff(stamps) * 1000
-    expected_gap = CONFIG["block_samples"] / CONFIG["sample_rate"] * 1000
-    peak = float(np.max(np.abs(audio)))
-    overall = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-12)
+    expected = CONFIG["block_samples"] / CONFIG["sample_rate"] * 1000
+    duration = len(audio) / CONFIG["sample_rate"]
 
-    print("\n" + "=" * 52)
-    print(f"  blocks            {len(chunks)}")
-    print(f"  block size        {sizes.pop() if len(sizes) == 1 else sizes} samples")
-    print(f"  audio captured    {len(audio) / CONFIG['sample_rate']:.2f} s")
-    print(f"  block spacing     {gaps.mean():.1f} ms (expected {expected_gap:.1f})")
-    print(f"  worst spacing     {gaps.max():.1f} ms")
-    print(f"  dropped blocks    {cap.dropped}")
-    print(f"  level             {overall:.1f} dBFS, peak {peak:.3f}")
-    print(f"  quietest / loudest{min(levels):7.1f} / {max(levels):.1f} dBFS")
-    print("=" * 52)
+    print("\n" + "=" * 46)
+    print(f"  blocks          {len(chunks)}")
+    print(f"  block size      {sizes.pop() if len(sizes) == 1 else sizes} samples")
+    print(f"  audio           {duration:.2f} s")
+    print(f"  block spacing   {gaps.mean():.1f} ms (expected {expected:.1f})")
+    print(f"  worst spacing   {gaps.max():.1f} ms")
+    print(f"  dropped blocks  {cap.dropped}")
+    print("=" * 46)
 
     ok = True
 
-    if peak < 1e-4:
-        print("FAIL  Silence. The device opened but captured nothing.")
-        ok = False
-    elif peak > 0.99:
-        print("WARN  Clipping. Turn the input gain down.")
-    elif max(levels) - min(levels) < 6 and not args.wav:
-        print("WARN  The level barely moved. Either nobody spoke, or the mic")
-        print("      applies automatic gain. noise_level depends on that range.")
+    if len(sizes) > 1:
+        print(f"WARN  Block size varied: {sorted(sizes)}. Can happen when the")
+        print("      capture rate is not a whole multiple of 16000. Harmless.")
 
     if cap.dropped:
-        print(f"WARN  {cap.dropped} blocks dropped. Something downstream is too slow.")
+        print(f"FAIL  {cap.dropped} blocks dropped, so audio was lost.")
+        ok = False
 
-    if gaps.max() > expected_gap * 2.5:
+    if gaps.max() > expected * 2.5:
         print(f"WARN  A {gaps.max():.0f} ms gap between blocks. Occasional hiccups")
         print("      are normal; frequent ones mean the machine is struggling.")
 
+    # Blocks should account for the elapsed time, or something stalled.
+    covered = duration / (stamps[-1] - stamps[0] + expected / 1000)
+    if covered < 0.95:
+        print(f"WARN  Blocks cover only {covered:.0%} of the elapsed time.")
+
     OUT.parent.mkdir(exist_ok=True)
     sf.write(OUT, audio, CONFIG["sample_rate"])
-    print(f"\nSaved to {OUT}")
+    saved = sf.info(OUT)
+    print(f"\n  saved           {OUT.name}")
+    print(f"  reads back      {saved.duration:.2f} s, {saved.samplerate} Hz, "
+          f"{saved.channels} ch")
 
+    if abs(saved.duration - duration) > 0.05 or saved.samplerate != CONFIG["sample_rate"]:
+        print("FAIL  The saved file does not match what was captured.")
+        ok = False
+
+    print("\nPASS" if ok else "\nFAILED")
     return 0 if ok else 1
 
 

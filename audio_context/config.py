@@ -9,13 +9,12 @@ CONFIG = {
     "frame_samples":       512,    # 32 ms, also fixed by Silero
     "block_samples":       2048,   # 128 ms per callback
 
-    # Measured on Windows with tools/check_devices.py. Re-run that on the lab
-    # machines: the name may differ and input_backend should become None.
-    "input_device":        "USBAudio1.0",
-    "input_backend":       "WASAPI",
-    "input_channels":      2,
-    "use_channel":         0,      # the mic is mono, duplicated to stereo
-    "capture_sample_rate": 48000,
+    # Name fragment, matched ignoring spaces and case, so this finds both
+    # "Microphone (USBAudio1.0)" on Windows and "USB Audio Device" on Linux.
+    # Falls back to the system default if nothing matches.
+    "input_device":        "USB Audio",
+    "input_channels":      None,   # None = ask the device
+    "capture_sample_rate": None,   # None = ask the device
     "warmup_blocks":       2,      # some backends open with digital silence
 
     # --- voice detection -------------------------------------------
