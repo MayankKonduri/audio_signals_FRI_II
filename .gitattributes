@@ -1,0 +1,3 @@
+# Commit LF endings, so files written on Windows still work when the repo is
+# cloned onto the lab's Ubuntu machines.
+* text=auto eol=lf

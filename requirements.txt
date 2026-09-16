@@ -1,0 +1,9 @@
+# Pin numpy below 2: ROS 2 Humble's cv_bridge crashes with numpy 2, and the
+# vision node uses it. This pin protects your teammates, not just you.
+numpy<2
+
+scipy              # resampling
+sounddevice        # microphone capture
+soundfile          # reading and writing WAV files
+faster-whisper     # speech-to-text, and ships the Silero voice detector
+praat-parselmouth  # pitch and intensity, gated path only
