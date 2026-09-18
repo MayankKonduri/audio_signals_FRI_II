@@ -1,12 +1,20 @@
-# Goal: turn a microphone or a WAV file into identical blocks of mono 16 kHz
-# audio, each stamped with when it was captured. Nothing is written to disk.
+# Goal: the one place audio enters the program. Turns a microphone or a WAV
+# file into identical blocks of mono 16 kHz audio, each stamped with when it
+# was captured. Nothing is written to disk.
 #
-#   cap = AudioCapture(CONFIG)                       # microphone
-#   cap = AudioCapture(CONFIG, wav="clips/x.wav")    # file, same output
-#   cap.start()
-#   for block in cap.blocks():
-#       print(block.t, len(block.samples))
-#   cap.stop()
+# The microphone can only be held by one thing at a time, so nothing else
+# opens it. Every consumer reads from here instead.
+#
+# One consumer:
+#   with AudioCapture(CONFIG) as cap:            # or wav="clips/x.wav"
+#       for block in cap.blocks():
+#           print(block.t, len(block.samples))
+#
+# Several at once, each receiving every block, so loudness.py and vad.py
+# analyse exactly the same audio rather than splitting it between them:
+#   with AudioCapture(CONFIG) as cap:
+#       q1, q2 = cap.subscribe(), cap.subscribe()
+#       cap.run_in_thread()          # None arrives on each queue at the end
 
 import queue
 import threading
@@ -44,15 +52,12 @@ def resolve_device(spec):
     ]
 
     if not matches:
-        print(f"note: no input device matching {spec!r}, using the system default")
-        return None
+        return None      # not found, so the system default is used
 
     # Windows lists one mic under several backends. WASAPI reaches every
     # channel at the device's real rate, where MME caps at 2 and reports 44100.
     wasapi = [m for m in matches if "wasapi" in api_of(m[1]).lower()]
-    index, dev = (wasapi or matches)[0]
-    print(f"device [{index}] {dev['name']!r} via {api_of(dev)}")
-    return index
+    return (wasapi or matches)[0][0]
 
 
 class Resampler:
@@ -108,14 +113,22 @@ class AudioCapture:
         self.target_rate = cfg["sample_rate"]
         self.block_samples = cfg["block_samples"]
 
-        self._q = queue.Queue(maxsize=64)
+        self._raw = queue.Queue(maxsize=64)  # undecoded, straight off the device
+        self._subs = []                      # one delivery queue per consumer
         self._stream = None
         self._thread = None
+        self._pump = None
         self._stop = threading.Event()
         self._resampler = None
+        self._seen = 0
+        self._warmup = 0 if wav else cfg.get("warmup_blocks", 2)
         self.dropped = 0
-        self.source_rate = None
+        self.source_rate = None     # what the device or file gave us
         self.channels = None
+        self.device_name = None     # nothing is printed from here; read these
+        self.backend = None         # if a caller wants to report the device
+
+    # -- lifecycle ---------------------------------------------------------
 
     def start(self):
         if self.wav:
@@ -130,9 +143,10 @@ class AudioCapture:
             self._stream.stop()
             self._stream.close()
             self._stream = None
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        for t in (self._thread, self._pump):
+            if t is not None:
+                t.join(timeout=2.0)
+        self._thread = self._pump = None
 
     def __enter__(self):
         return self.start()
@@ -140,11 +154,15 @@ class AudioCapture:
     def __exit__(self, *exc):
         self.stop()
 
+    # -- sources -----------------------------------------------------------
+
     def _start_mic(self):
         import sounddevice as sd
 
         device = resolve_device(self.cfg["input_device"])
         info = sd.query_devices(device if device is not None else sd.default.device[0])
+        self.device_name = info["name"]
+        self.backend = sd.query_hostapis()[info["hostapi"]]["name"]
 
         self.channels = self.cfg["input_channels"] or int(info["max_input_channels"])
         self.source_rate = int(self.cfg["capture_sample_rate"]
@@ -159,7 +177,7 @@ class AudioCapture:
                 print(f"audio status: {status}")
             t = time.time() - frames / self.source_rate
             try:
-                self._q.put_nowait(Block(t, indata.copy()))
+                self._raw.put_nowait(Block(t, indata.copy()))
             except queue.Full:
                 self.dropped += 1
 
@@ -168,17 +186,16 @@ class AudioCapture:
             blocksize=in_block, dtype="float32", callback=callback,
         )
         self._stream.start()
-        print(f"microphone: {info['name']!r}, {self.channels} ch @ {self.source_rate} Hz "
-              f"-> mono @ {self.target_rate} Hz")
 
     def _start_file(self):
         data, rate = sf.read(self.wav, dtype="float32", always_2d=True)
+        self.device_name = self.wav
         self.source_rate = rate
         self.channels = data.shape[1]
         self._resampler = Resampler(rate, self.target_rate)
         in_block = round(self.block_samples * rate / self.target_rate)
 
-        def pump():
+        def feed():
             base = time.time()
             for i in range(0, len(data) - in_block + 1, in_block):
                 if self._stop.is_set():
@@ -188,32 +205,72 @@ class AudioCapture:
                     delay = t - time.time()
                     if delay > 0:
                         time.sleep(delay)
-                self._q.put(Block(t, data[i:i + in_block]))
-            self._q.put(None)
+                self._raw.put(Block(t, data[i:i + in_block]))
+            self._raw.put(None)             # end of file
 
-        self._thread = threading.Thread(target=pump, daemon=True)
+        self._thread = threading.Thread(target=feed, daemon=True)
         self._thread.start()
-        print(f"file: {self.wav}, {self.channels} ch @ {rate} Hz, "
-              f"{len(data) / rate:.1f}s -> mono @ {self.target_rate} Hz")
 
-    def blocks(self, timeout=1.0):
-        # Skips the first blocks: some backends send digital silence while the
-        # device spins up, which is not a reading of the room.
-        warmup = 0 if self.wav else self.cfg.get("warmup_blocks", 2)
-        seen = 0
+    # -- decoding ----------------------------------------------------------
 
+    def _next(self, timeout):
+        # One finished block, or None when the source runs out.
         while not self._stop.is_set():
             try:
-                item = self._q.get(timeout=timeout)
+                item = self._raw.get(timeout=timeout)
             except queue.Empty:
                 continue
             if item is None:
+                return None
+
+            self._seen += 1
+            mono = to_mono(item.samples)
+            resampled = self._resampler(mono)   # always run, to keep state warm
+
+            # Some backends send digital silence while the device spins up,
+            # which is not a reading of the room.
+            if self._seen <= self._warmup:
+                continue
+            return Block(item.t, resampled)
+        return None
+
+    # -- one consumer ------------------------------------------------------
+
+    def blocks(self, timeout=1.0):
+        # Iterate the stream directly. Use this when one thing needs the
+        # audio; use subscribe() plus run() when several do.
+        while True:
+            block = self._next(timeout)
+            if block is None:
+                return
+            yield block
+
+    # -- several consumers -------------------------------------------------
+
+    def subscribe(self, maxsize=64):
+        # Register a consumer and hand back its own queue. Every subscriber
+        # receives every block, so two modules reading the same stream see
+        # identical audio instead of taking alternate blocks.
+        # Call before run(); a queue added later misses what has gone past.
+        q = queue.Queue(maxsize=maxsize)
+        self._subs.append(q)
+        return q
+
+    def run(self, timeout=1.0):
+        # Pump blocks to every subscriber until stopped or the source ends,
+        # then put None on each queue so consumers know it is over.
+        while True:
+            block = self._next(timeout)
+            for q in self._subs:
+                try:
+                    q.put_nowait(block)
+                except queue.Full:
+                    self.dropped += 1
+            if block is None:
                 return
 
-            seen += 1
-            mono = to_mono(item.samples)
-            resampled = self._resampler(mono)      # always run, to keep state warm
-
-            if seen <= warmup:
-                continue
-            yield Block(item.t, resampled)
+    def run_in_thread(self, timeout=1.0):
+        # run() blocks, so this is the usual way: start pumping and carry on.
+        self._pump = threading.Thread(target=self.run, args=(timeout,), daemon=True)
+        self._pump.start()
+        return self._pump

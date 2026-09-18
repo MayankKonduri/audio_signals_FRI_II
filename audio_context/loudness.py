@@ -1,8 +1,12 @@
 # Goal: measure how loud each 32 ms slice of audio is, in dBFS.
-# Takes arrays, returns arrays. Never touches the microphone.
+# Receives blocks, never opens the microphone, and makes no judgement about
+# what the sound is - that belongs to vad.py.
 #
-#   frames = to_frames(block.samples, 512)
-#   db = rms_db(frames)          # one value per frame, always negative
+#   db = loudness.from_block(block)   # one dB value per 32 ms frame
+#
+# The caller owns the stream. processor.py opens one AudioCapture and hands
+# the same block to this module and to vad.py, so both read identical frames
+# and their results line up index by index.
 
 import numpy as np
 
@@ -24,6 +28,7 @@ def to_frames(samples, frame_samples):
 def rms_db(frames):
     # Root mean square per frame, converted to decibels relative to full
     # scale. 0 dBFS is the loudest a sample can be, so values are negative.
+    # float64 because a quiet room squares down to around 1e-7.
     if frames.size == 0:
         return np.empty(0, dtype=np.float64)
     rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
@@ -35,11 +40,9 @@ def is_real(db):
     return db > SILENCE_DB
 
 
-def summarize(db, mask=None):
-    # Median dB of the frames selected by mask, ignoring digital silence.
-    # Median rather than mean so one loud clatter cannot move the answer.
-    # Returns None when nothing usable is left, which the caller must handle.
-    sel = is_real(db) if mask is None else (is_real(db) & mask)
-    if not np.any(sel):
-        return None
-    return float(np.median(db[sel]))
+def from_block(block, frame_samples=None):
+    # One dB value per frame of a block from capture.py.
+    if frame_samples is None:
+        from audio_context.config import CONFIG
+        frame_samples = CONFIG["frame_samples"]
+    return rms_db(to_frames(block.samples, frame_samples))

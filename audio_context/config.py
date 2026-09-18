@@ -39,6 +39,10 @@ CONFIG = {
     "window_sec":          1.0,
     "ratio_window_sec":    10.0,   # rename speech_ratio_10s if you change this
 
+    # --- frame buffer, the recent past of both piles ---------------
+    "buffer_seconds":      15.0,   # about 470 frames at 32 ms each
+    "buffer_dir":          "data", # background.db and voice.db land here
+
     # --- ring buffer, in memory only -------------------------------
     "ring_buffer_sec":     20.0,   # long enough for the longest utterance
     "stt_lookback_sec":    10.0,   # how far back to transcribe when engaged
