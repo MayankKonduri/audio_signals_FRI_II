@@ -45,7 +45,13 @@ CONFIG = {
                                    # genuinely quiet frames instead.
     "floor_window_sec":    30.0,
     "floor_min_frames":    100,    # report no floor until this much quiet
-    "min_speech_frames":   3,      # fewer than this and SNR is mostly chance
+    "min_speech_frames":   10,     # about 0.3 s. Fewer than this and the SNR
+                                   # is reporting stragglers rather than a
+                                   # voice: a couple of stray frames left in
+                                   # the store after someone stopped talking
+                                   # produced a reading of +1.7 dB, which the
+                                   # LLM would read as a very distant speaker
+                                   # when nobody had spoken for ten seconds.
 
     # --- utterances ------------------------------------------------
     "utterance_open_sec":  0.25,

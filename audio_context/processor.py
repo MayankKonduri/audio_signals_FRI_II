@@ -32,8 +32,11 @@ import numpy as np
 from audio_context import frames as fr
 from audio_context import loudness, vad
 from audio_context.capture import AudioCapture
+from audio_context import state
 from audio_context.counters import Counters
 from audio_context.frames import Buffer
+from audio_context.ring import RingBuffer
+from audio_context.stt import Transcriber
 from audio_context.utterance import Utterance
 
 # One per block. db and voice are the same length, one entry per 32 ms frame.
@@ -65,8 +68,17 @@ class Processor:
         # smoothed verdict rather than the raw per-frame one.
         self.counters = Counters(cfg)
 
+        # Raw audio, always kept, so a finished utterance can be pulled back
+        # out. Filling even when not engaged is the point: the words spoken
+        # just before the decision to engage are still here.
+        self.ring = RingBuffer(cfg)
+        self.stt = Transcriber(cfg, verbose=verbose)
+        self.ignored = 0           # blocks dropped while the robot spoke
+
     def _report(self, background, speech):
         # One line per block: the two piles, then the state of the stores.
+        if not background and not speech:
+            return              # suppressed block, nothing was measured
         stamp = min(f.t for f in background + speech)
         bg = f"{np.median([f.db for f in background]):7.1f}" if background else "      -"
         sp = f"{np.median([f.db for f in speech]):7.1f}" if speech else "      -"
@@ -74,6 +86,17 @@ class Processor:
         print(f"  {stamp:.3f}  |  background {len(background)} @{bg} dBFS  |  "
               f"speech {len(speech)} @{sp} dBFS  |  bg {n_bg:3d} / voice {n_sp:3d} "
               f"/ oldest {self.buffer.span():4.1f}s")
+
+    def _finish(self, span):
+        # An utterance just ended. Transcribe it, but only when engaged:
+        # this is the most expensive thing in the pipeline, and transcribing
+        # bystanders who never agreed to anything is worth avoiding.
+        self.spans.append(span)
+        if not state.engaged():
+            return
+        samples = self.ring.slice(span.start, span.end)
+        if samples is not None:
+            self.stt.request(samples, when=span.end)
 
     def _analyse(self, block):
         # Everything that happens to one block. Both modules receive the same
@@ -91,8 +114,22 @@ class Processor:
         vad.warm_up()   # load the detector before the first block arrives
         deadline = None if seconds is None else time.time() + seconds
 
+        self.stt.warm_up()
+        self.stt.start()
+
         with AudioCapture(self.cfg, wav=wav) as cap:
             for block in cap.blocks():
+                # The robot hears itself. While its own voice is playing, and
+                # briefly after while the room still rings with it, none of
+                # this audio describes the room or a person.
+                if state.ignore_audio(block.t):
+                    # Still yield, so a caller watching for a stop signal
+                    # sees it. Both piles empty says nothing was measured.
+                    self.ignored += 1
+                    yield Result(block.t, np.empty(0), np.empty(0, dtype=bool))
+                    continue
+
+                self.ring.add(block)
                 result = self._analyse(block)
                 if len(result.db) == 0:
                     continue
@@ -118,7 +155,7 @@ class Processor:
             for f in sorted(background + speech, key=lambda f: f.t):
                 span = self.utterance.push(f)
                 if span is not None:
-                    self.spans.append(span)
+                    self._finish(span)
                 self.counters.push(f, self.utterance.speech_now)
             if self.verbose:
                 self._report(background, speech)
