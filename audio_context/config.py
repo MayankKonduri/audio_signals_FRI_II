@@ -9,16 +9,28 @@ CONFIG = {
     "frame_samples":       512,    # 32 ms, also fixed by Silero
     "block_samples":       2048,   # 128 ms per callback
 
-    # Name fragment, matched ignoring spaces and case, so this finds both
-    # "Microphone (USBAudio1.0)" on Windows and "USB Audio Device" on Linux.
-    # Falls back to the system default if nothing matches.
-    "input_device":        "USB Audio",
+    # None uses the system default microphone. To pin a specific device, put
+    # a fragment of its name here: matching ignores spaces and case, so
+    # "USB Audio" finds both "Microphone (USBAudio1.0)" on Windows and
+    # "USB Audio Device" on Linux. Falls back to the default if it is not
+    # found, so a missing device never stops the node.
+    "input_device":        None,
     "input_channels":      None,   # None = ask the device
     "capture_sample_rate": None,   # None = ask the device
     "warmup_blocks":       2,      # some backends open with digital silence
 
     # --- voice detection -------------------------------------------
-    "vad_threshold":       0.5,    # TUNE against the Hallway clip
+    "vad_normalise_db":    -25.0,  # Level the detector's copy of the audio is
+                                   # scaled to before it is scored. Silero is
+                                   # level-sensitive, so distant speech at
+                                   # -60 dBFS is much easier to spot once
+                                   # brought up. Applied only to the detector:
+                                   # loudness.py still measures the real level.
+                                   # None disables it.
+    "vad_threshold":       0.35,   # TUNE. Lower catches quieter and more
+                                   # distant speech; too low and the detector
+                                   # starts firing on noise. Check against a
+                                   # Hallway clip after changing it.
 
     # --- noise floor -----------------------------------------------
     "quiet_max_db":        -50.0,  # TUNE. Placeholders, not measurements.
@@ -26,12 +38,22 @@ CONFIG = {
                                    # locations with the robot running, then
                                    # put the cutoffs in the gaps.
     "level_hysteresis_db": 2.0,    # stops the label flickering at a cutoff
+    "floor_percentile":    20,     # not the median: while someone talks, the
+                                   # background store fills with the pauses
+                                   # inside their speech, which sit well above
+                                   # the room. A lower percentile favours the
+                                   # genuinely quiet frames instead.
     "floor_window_sec":    30.0,
     "floor_min_frames":    100,    # report no floor until this much quiet
     "min_speech_frames":   3,      # fewer than this and SNR is mostly chance
 
     # --- utterances ------------------------------------------------
     "utterance_open_sec":  0.25,
+    "utterance_open_ratio": 0.6,   # of the frames in that window, how many
+                                   # must be voice. Requiring an unbroken run
+                                   # made distant speech almost impossible to
+                                   # register, because the detector flickers
+                                   # at low SNR and one gap reset the count.
     "utterance_close_sec": 0.50,
     "utterance_max_sec":   15.0,
 
@@ -40,7 +62,7 @@ CONFIG = {
     "ratio_window_sec":    10.0,   # rename speech_ratio_10s if you change this
 
     # --- frame buffer, the recent past of both piles ---------------
-    "buffer_seconds":      15.0,   # about 470 frames at 32 ms each
+    "buffer_seconds":      10.0,   # about 310 frames at 32 ms each
     "buffer_dir":          "data", # background.db and voice.db land here
 
     # --- ring buffer, in memory only -------------------------------

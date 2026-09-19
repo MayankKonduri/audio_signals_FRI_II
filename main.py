@@ -43,7 +43,8 @@ def main():
     show_build = args.show in ("both", "builder")
 
     proc = Processor(CONFIG, verbose=show_proc)
-    builder = Builder(CONFIG, proc.buffer, verbose=show_build)
+    builder = Builder(CONFIG, proc.buffer, proc.utterance, proc.counters,
+                      verbose=show_build)
 
     stopping = threading.Event()   # set by Ctrl+C, watched by both loops
     finished = threading.Event()   # set when the audio source runs out

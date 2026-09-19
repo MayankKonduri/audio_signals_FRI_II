@@ -32,7 +32,9 @@ import numpy as np
 from audio_context import frames as fr
 from audio_context import loudness, vad
 from audio_context.capture import AudioCapture
+from audio_context.counters import Counters
 from audio_context.frames import Buffer
+from audio_context.utterance import Utterance
 
 # One per block. db and voice are the same length, one entry per 32 ms frame.
 Result = namedtuple("Result", "t db voice")
@@ -53,6 +55,15 @@ class Processor:
         # frames dropped once full.
         self.buffer = Buffer(cfg["buffer_dir"], cfg["buffer_seconds"],
                              self.frame_sec)
+
+        # Every frame goes through the tracker in order, so it can smooth the
+        # verdicts into utterances. The builder reads speech_now from it.
+        self.utterance = Utterance(cfg)
+        self.spans = []            # utterances that have finished
+
+        # Rolling counts over the last few seconds, fed the tracker's
+        # smoothed verdict rather than the raw per-frame one.
+        self.counters = Counters(cfg)
 
     def _report(self, background, speech):
         # One line per block: the two piles, then the state of the stores.
@@ -102,6 +113,13 @@ class Processor:
         for result in self.run(wav=wav, seconds=seconds):
             background, speech = fr.from_result(result, self.frame_sec)
             self.buffer.add(background, speech)
+
+            # In time order, which matters: the tracker is a state machine.
+            for f in sorted(background + speech, key=lambda f: f.t):
+                span = self.utterance.push(f)
+                if span is not None:
+                    self.spans.append(span)
+                self.counters.push(f, self.utterance.speech_now)
             if self.verbose:
                 self._report(background, speech)
             yield background, speech

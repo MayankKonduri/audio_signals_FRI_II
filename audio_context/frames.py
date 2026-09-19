@@ -93,6 +93,14 @@ class FrameStore:
             self._conn.execute("DELETE FROM frames")
         self._conn.commit()
 
+    def prune(self, cutoff):
+        # Drop everything older than the cutoff. Called every block for both
+        # stores, whether or not they received frames, or a store that stops
+        # receiving would hold its last frames forever.
+        with self._lock:
+            self._conn.execute("DELETE FROM frames WHERE t < ?", (cutoff,))
+            self._conn.commit()
+
     def add(self, frames, cutoff=None):
         # Two limits, and both are needed.
         #
@@ -166,7 +174,10 @@ class Buffer:
         # two always cover the same stretch of time. Taken before filtering,
         # so a block of nothing but silence still advances the window.
         stamps = [f.t for f in background + speech]
-        cutoff = max(stamps) - self.seconds if stamps else None
+        if not stamps:
+            return
+        newest = max(stamps)
+        cutoff = newest - self.seconds
 
         # Only real readings go in. Dropped frames are counted, because a
         # high count means the microphone is muting itself rather than
@@ -177,6 +188,13 @@ class Buffer:
 
         self._bg.add(keep_bg, cutoff)
         self._sp.add(keep_sp, cutoff)
+
+        # Both stores age every block, not just the one that received frames.
+        # Without this, a store that stops receiving keeps its last frames
+        # indefinitely, so speech_snr_db would go on reporting a voice that
+        # fell silent half a minute ago.
+        self._bg.prune(cutoff)
+        self._sp.prune(cutoff)
 
     def background(self):
         return self._bg.all(voice=False)
